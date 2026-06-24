@@ -101,10 +101,142 @@ export class ThreeTierCdkStack extends cdk.Stack {
       healthCheck: { path: '/', interval: cdk.Duration.seconds(30) },
     });
 
+    // ============ NEW VPC WITH PUBLIC AND PRIVATE SUBNETS ============
+    const newVpc = new ec2.Vpc(this, 'NewVpc', {
+      cidr: '10.1.0.0/16',
+      maxAzs: 2,
+      natGateways: 1,
+      subnetConfiguration: [
+        {
+          name: 'PublicSubnet',
+          subnetType: ec2.SubnetType.PUBLIC,
+          cidrMask: 24,
+        },
+        {
+          name: 'PrivateSubnet',
+          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          cidrMask: 24,
+        },
+      ],
+    });
+
+    // Security group for new VPC instance
+    const newInstanceSg = new ec2.SecurityGroup(this, 'NewInstanceSg', {
+      vpc: newVpc,
+      allowAllOutbound: true,
+      description: 'Security group for EC2 instance in new VPC',
+    });
+    newInstanceSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(22),
+      'Allow SSH from anywhere'
+    );
+    newInstanceSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(80),
+      'Allow HTTP from anywhere'
+    );
+    newInstanceSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(443),
+      'Allow HTTPS from anywhere'
+    );
+    newInstanceSg.addIngressRule(
+      ec2.Peer.anyIpv4(),
+      ec2.Port.tcp(8080),
+      'Allow Jenkins from anywhere'
+    );
+
+    // IAM role for new instance (SSM access)
+    const newInstanceRole = new iam.Role(this, 'NewInstanceRole', {
+      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
+    });
+    newInstanceRole.addManagedPolicy(
+      iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')
+    );
+
+    // Get public subnets for the new VPC
+    const publicSubnets = newVpc.publicSubnets;
+
+    // Launch EC2 instance in public subnet
+    const newInstance = new ec2.Instance(this, 'PublicInstance', {
+      vpc: newVpc,
+      vpcSubnets: {
+        subnets: [publicSubnets[0]], // Deploy in first public subnet (AZ1)
+      },
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      machineImage: ec2.MachineImage.latestAmazonLinux2023({
+        cpuType: ec2.AmazonLinuxCpuType.X86_64,
+      }),
+      securityGroup: newInstanceSg,
+      role: newInstanceRole,
+      blockDevices: [
+        {
+          deviceName: '/dev/xvda',
+          volume: ec2.BlockDeviceVolume.ebs(20, {
+            volumeType: ec2.EbsDeviceVolumeType.GP3,
+            deleteOnTermination: true,
+          }),
+        },
+      ],
+    });
+
+    // User data for the new instance
+    const newUserData = ec2.UserData.forLinux();
+    newUserData.addCommands(
+      'set -eux',
+      'yum -y update',
+      // Install Git
+      'yum -y install git',
+      // Install JDK 21
+      'yum -y install java-21-amazon-corretto-devel',
+      // Set JAVA_HOME
+      'echo "export JAVA_HOME=/usr/lib/jvm/java-21-amazon-corretto" >> /etc/profile.d/java.sh',
+      'source /etc/profile.d/java.sh',
+      // Install Jenkins
+      'wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/redhat-stable/jenkins.repo',
+      'rpm --import https://pkg.jenkins.io/redhat-stable/jenkins.io.key',
+      'yum -y upgrade',
+      'yum -y install jenkins',
+      // Start Jenkins
+      'systemctl daemon-reload',
+      'systemctl enable jenkins',
+      'systemctl start jenkins',
+      // Install Nginx for reverse proxy
+      'yum -y install nginx',
+      // Get instance metadata
+      'INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)',
+      'INSTANCE_AZ=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)',
+      'PRIVATE_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)',
+      `echo "<h1>Jenkins Instance</h1><p>Instance ID: $INSTANCE_ID</p><p>AZ: $INSTANCE_AZ</p><p>Private IP: $PRIVATE_IP</p><p>Jenkins running on port 8080</p><p>Git version: $(git --version)</p><p>Java version: $(java -version 2>&1 | head -1)</p>" > /usr/share/nginx/html/index.html`,
+      'systemctl enable nginx',
+      'systemctl start nginx'
+    );
+    newInstance.addUserData(newUserData.render());
+
     // Outputs
     new cdk.CfnOutput(this, 'AlbDns', { value: `http://${alb.loadBalancerDnsName}` });
     new cdk.CfnOutput(this, 'DbEndpoint', { value: db.instanceEndpoint.hostname });
     if (db.secret) new cdk.CfnOutput(this, 'DbSecretName', { value: db.secret.secretName });
+
+    // New VPC Outputs
+    new cdk.CfnOutput(this, 'NewVpcId', { value: newVpc.vpcId });
+    new cdk.CfnOutput(this, 'NewPublicSubnet1', {
+      value: publicSubnets[0].subnetId,
+      description: 'First Public Subnet (AZ1)',
+    });
+    new cdk.CfnOutput(this, 'NewPublicSubnet2', {
+      value: publicSubnets[1].subnetId,
+      description: 'Second Public Subnet (AZ2)',
+    });
+    new cdk.CfnOutput(this, 'NewInstanceId', {
+      value: newInstance.instanceId,
+      description: 'EC2 Instance ID in public subnet',
+    });
+    new cdk.CfnOutput(this, 'NewInstancePublicIp', {
+      value: newInstance.instancePublicIp || 'N/A',
+      description: 'Public IP of the new instance',
+    });
   }
 }
 
